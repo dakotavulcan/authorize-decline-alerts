@@ -1,0 +1,120 @@
+name: Authorize.Net Decline Monitor
+
+on:
+  schedule:
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "live"
+        type: choice
+        options:
+          - live
+          - test_latest_decline
+          - bootstrap
+
+permissions:
+  contents: write
+
+concurrency:
+  group: authorize-net-decline-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    env:
+      AUTHNET_API_LOGIN_ID: ${{ secrets.AUTHNET_API_LOGIN_ID }}
+      AUTHNET_TRANSACTION_KEY: ${{ secrets.AUTHNET_TRANSACTION_KEY }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+      RUN_MODE: ${{ inputs.mode || 'live' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Decrypt private monitor state
+        shell: bash
+        run: |
+          if [ -f state.enc ]; then
+            openssl enc \
+              -d \
+              -aes-256-cbc \
+              -pbkdf2 \
+              -iter 200000 \
+              -in state.enc \
+              -out .state.json \
+              -pass env:STATE_ENCRYPTION_KEY
+          fi
+
+      - name: Check Authorize.Net
+        shell: bash
+        run: |
+          python3 monitor.py
+
+      - name: Encrypt updated monitor state
+        shell: bash
+        run: |
+          if [ -f .state_changed ]; then
+            openssl enc \
+              -aes-256-cbc \
+              -salt \
+              -pbkdf2 \
+              -iter 200000 \
+              -in .state.json \
+              -out state.enc \
+              -pass env:STATE_ENCRYPTION_KEY
+          fi
+
+          rm -f .state.json
+          rm -f .state_changed
+
+      - name: Save state and keep schedule active
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          SHOULD_PUSH=0
+
+          if [ -n "$(git status --porcelain -- state.enc)" ]; then
+
+            git add state.enc
+            git commit -m "chore: update encrypted monitor state"
+
+            SHOULD_PUSH=1
+
+          else
+
+            LAST_COMMIT=$(git log -1 --format=%ct)
+            NOW=$(date +%s)
+
+            AGE=$((NOW - LAST_COMMIT))
+
+            if [ "$AGE" -ge 2592000 ]; then
+
+              git commit \
+                --allow-empty \
+                -m "chore: keep scheduled monitor active"
+
+              SHOULD_PUSH=1
+            fi
+          fi
+
+          if [ "$SHOULD_PUSH" -eq 1 ]; then
+
+            git pull \
+              --rebase \
+              origin \
+              "$GITHUB_REF_NAME"
+
+            git push \
+              origin \
+              HEAD:"$GITHUB_REF_NAME"
+          fi
