@@ -33,6 +33,7 @@ jobs:
       AUTHNET_TRANSACTION_KEY: ${{ secrets.AUTHNET_TRANSACTION_KEY }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+      TARGET_SOLUTION_NAME: ${{ secrets.TARGET_SOLUTION_NAME }}
       RUN_MODE: ${{ inputs.mode || 'live' }}
 
     steps:
