@@ -2,7 +2,20 @@ name: Authorize.Net Decline Monitor
 
 on:
   schedule:
-    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+    # Start each runner a few minutes BEFORE its shift.
+    # This avoids GitHub's busiest top-of-hour scheduling period.
+    #
+    # Shift 1: 8:00 AM - 12:00 PM Eastern
+    - cron: "52 7 * * 1-5"
+      timezone: "America/New_York"
+
+    # Shift 2: 12:00 PM - 4:00 PM Eastern
+    - cron: "52 11 * * 1-5"
+      timezone: "America/New_York"
+
+    # Shift 3: 4:00 PM - 8:00 PM Eastern
+    - cron: "52 15 * * 1-5"
+      timezone: "America/New_York"
 
   workflow_dispatch:
     inputs:
@@ -26,7 +39,10 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+
+    # Each scheduled shift is about 4 hours.
+    # GitHub-hosted jobs have a 6-hour maximum.
+    timeout-minutes: 270
 
     env:
       AUTHNET_API_LOGIN_ID: ${{ secrets.AUTHNET_API_LOGIN_ID }}
@@ -38,7 +54,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Decrypt private monitor state
         shell: bash
@@ -54,15 +70,35 @@ jobs:
               -pass env:STATE_ENCRYPTION_KEY
           fi
 
-      - name: Check Authorize.Net
+      - name: Configure state storage
         shell: bash
         run: |
-          python3 monitor.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Encrypt updated monitor state
+      - name: Run decline monitor
         shell: bash
         run: |
-          if [ -f .state_changed ]; then
+          set -euo pipefail
+
+          cleanup() {
+            rm -f .state.json
+            rm -f .state_changed
+          }
+
+          trap cleanup EXIT
+
+
+          # --------------------------------------------------
+          # SAVE ENCRYPTED STATE IF MONITOR CHANGED IT
+          # --------------------------------------------------
+
+          persist_state() {
+
+            if [ ! -f .state_changed ]; then
+              return 0
+            fi
+
             openssl enc \
               -aes-256-cbc \
               -salt \
@@ -71,44 +107,15 @@ jobs:
               -in .state.json \
               -out state.enc \
               -pass env:STATE_ENCRYPTION_KEY
-          fi
-
-          rm -f .state.json
-          rm -f .state_changed
-
-      - name: Save state and keep schedule active
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          SHOULD_PUSH=0
-
-          if [ -n "$(git status --porcelain -- state.enc)" ]; then
 
             git add state.enc
-            git commit -m "chore: update encrypted monitor state"
 
-            SHOULD_PUSH=1
-
-          else
-
-            LAST_COMMIT=$(git log -1 --format=%ct)
-            NOW=$(date +%s)
-
-            AGE=$((NOW - LAST_COMMIT))
-
-            if [ "$AGE" -ge 2592000 ]; then
-
-              git commit \
-                --allow-empty \
-                -m "chore: keep scheduled monitor active"
-
-              SHOULD_PUSH=1
+            if git diff --cached --quiet; then
+              rm -f .state_changed
+              return 0
             fi
-          fi
 
-          if [ "$SHOULD_PUSH" -eq 1 ]; then
+            git commit -m "chore: update encrypted monitor state"
 
             git pull \
               --rebase \
@@ -118,4 +125,155 @@ jobs:
             git push \
               origin \
               HEAD:"$GITHUB_REF_NAME"
+
+            rm -f .state_changed
+          }
+
+
+          # --------------------------------------------------
+          # KEEP PUBLIC REPO ACTIVE
+          # --------------------------------------------------
+
+          keepalive() {
+
+            LAST_COMMIT=$(git log -1 --format=%ct)
+            NOW=$(date +%s)
+            AGE=$((NOW - LAST_COMMIT))
+
+            # 30 days
+            if [ "$AGE" -ge 2592000 ]; then
+
+              git commit \
+                --allow-empty \
+                -m "chore: keep scheduled monitor active"
+
+              git pull \
+                --rebase \
+                origin \
+                "$GITHUB_REF_NAME"
+
+              git push \
+                origin \
+                HEAD:"$GITHUB_REF_NAME"
+            fi
+          }
+
+
+          # --------------------------------------------------
+          # RUN ONE AUTHORIZE.NET CHECK
+          # --------------------------------------------------
+
+          run_check() {
+
+            echo "Checking Authorize.Net at $(TZ=America/New_York date)"
+
+            python3 monitor.py
+
+            persist_state
+          }
+
+
+          # --------------------------------------------------
+          # MANUAL RUNS
+          # --------------------------------------------------
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+
+            run_check
+
+            keepalive
+
+            exit 0
           fi
+
+
+          # --------------------------------------------------
+          # DETERMINE WHICH 4-HOUR SHIFT THIS IS
+          # --------------------------------------------------
+
+          case "${{ github.event.schedule }}" in
+
+            "52 7 * * 1-5")
+              START_HOUR=8
+              END_HOUR=12
+              ;;
+
+            "52 11 * * 1-5")
+              START_HOUR=12
+              END_HOUR=16
+              ;;
+
+            "52 15 * * 1-5")
+              START_HOUR=16
+              END_HOUR=20
+              ;;
+
+            *)
+              echo "Unknown scheduled shift."
+              exit 1
+              ;;
+          esac
+
+
+          current_minutes() {
+
+            HOUR=$(TZ=America/New_York date +%H)
+            MINUTE=$(TZ=America/New_York date +%M)
+
+            echo $((10#$HOUR * 60 + 10#$MINUTE))
+          }
+
+
+          START_MINUTES=$((START_HOUR * 60))
+          END_MINUTES=$((END_HOUR * 60))
+
+
+          # --------------------------------------------------
+          # WAIT UNTIL SHIFT ACTUALLY STARTS
+          # --------------------------------------------------
+
+          while true; do
+
+            NOW_MINUTES=$(current_minutes)
+
+            if [ "$NOW_MINUTES" -ge "$START_MINUTES" ]; then
+              break
+            fi
+
+            sleep 15
+          done
+
+
+          echo "Shift started."
+          echo "Monitoring until ${END_HOUR}:00 Eastern."
+
+
+          # --------------------------------------------------
+          # CHECK EVERY FIVE MINUTES
+          # --------------------------------------------------
+
+          while true; do
+
+            NOW_MINUTES=$(current_minutes)
+
+            if [ "$NOW_MINUTES" -ge "$END_MINUTES" ]; then
+              break
+            fi
+
+            run_check
+
+
+            # Align the next run to a true 5-minute boundary:
+            # :00, :05, :10, :15, etc.
+
+            NOW_EPOCH=$(date +%s)
+
+            SLEEP_SECONDS=$((300 - (NOW_EPOCH % 300)))
+
+            sleep "$SLEEP_SECONDS"
+          done
+
+
+          echo "Shift finished."
+
+          keepalive
