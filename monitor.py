@@ -5,6 +5,8 @@ import hashlib
 import urllib.request
 import urllib.error
 from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 
 # ============================================================
@@ -45,6 +47,8 @@ RUN_MODE = os.environ.get(
     "RUN_MODE",
     "live"
 ).strip().lower()
+
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
 # ============================================================
@@ -221,7 +225,6 @@ def http_post(url, payload, slack=False):
             "Could not reach Authorize.Net."
         )
 
-    # Slack does not return Authorize.Net-style JSON.
     if slack:
         return raw
 
@@ -280,7 +283,6 @@ def get_unsettled():
         or []
     )
 
-    # Handle either possible JSON structure.
     if isinstance(transactions, dict):
 
         transactions = (
@@ -420,7 +422,6 @@ def load_state():
 
 def save_state(seen):
 
-    # Remove accidental duplicates.
     seen = list(
         dict.fromkeys(seen)
     )
@@ -440,8 +441,6 @@ def save_state(seen):
             separators=(",", ":")
         )
 
-    # This tells the GitHub workflow that
-    # encrypted state needs to be saved.
     with open(
         STATE_CHANGED_FILE,
         "w",
@@ -452,7 +451,7 @@ def save_state(seen):
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
 def first_value(*values):
@@ -493,6 +492,105 @@ def slack_escape(value):
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+# ============================================================
+# DATE / TIME HELPERS
+# ============================================================
+
+def parse_utc_time(value):
+
+    if not value:
+        return None
+
+    text = str(value).strip()
+
+    try:
+
+        parsed = datetime.fromisoformat(
+            text.replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+        if parsed.tzinfo is None:
+
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed.astimezone(
+            timezone.utc
+        )
+
+    except ValueError:
+
+        return None
+
+
+def format_eastern(dt):
+
+    local = dt.astimezone(
+        EASTERN_TZ
+    )
+
+    date_text = local.strftime(
+        "%a %b %d, %Y"
+    ).replace(
+        " 0",
+        " "
+    )
+
+    time_text = local.strftime(
+        "%I:%M %p"
+    ).lstrip("0")
+
+    return (
+        f"{date_text} "
+        f"{time_text} "
+        f"{local.tzname()}"
+    )
+
+
+def format_delay(seconds):
+
+    total_minutes = max(
+        0,
+        int(seconds // 60)
+    )
+
+    days, remainder = divmod(
+        total_minutes,
+        1440
+    )
+
+    hours, minutes = divmod(
+        remainder,
+        60
+    )
+
+    parts = []
+
+    if days:
+
+        parts.append(
+            f"{days}d"
+        )
+
+    if hours:
+
+        parts.append(
+            f"{hours}h"
+        )
+
+    if minutes or not parts:
+
+        parts.append(
+            f"{minutes}m"
+        )
+
+    return " ".join(parts)
 
 
 # ============================================================
@@ -599,6 +697,17 @@ def build_message(
         or "Unknown"
     )
 
+    submitted_at = parse_utc_time(
+        first_value(
+            summary.get("submitTimeUTC"),
+            details.get("submitTimeUTC"),
+        )
+    )
+
+    picked_up_at = datetime.now(
+        timezone.utc
+    )
+
     (
         code,
         api_text,
@@ -652,6 +761,50 @@ def build_message(
             f"{slack_escape(solution_name)}"
         ),
     ]
+
+    # --------------------------------------------------------
+    # TRANSACTION / PICKUP TIMES
+    # --------------------------------------------------------
+
+    if submitted_at:
+
+        lines.append(
+            (
+                f"*Transaction time:* "
+                f"{slack_escape(format_eastern(submitted_at))}"
+            )
+        )
+
+        lines.append(
+            (
+                f"*Picked up:* "
+                f"{slack_escape(format_eastern(picked_up_at))}"
+            )
+        )
+
+        delay_seconds = (
+            picked_up_at
+            - submitted_at
+        ).total_seconds()
+
+        # If the transaction is 10+ minutes old,
+        # clearly flag that this was a delayed pickup.
+        #
+        # This is especially useful for:
+        # - overnight declines
+        # - after-hours declines
+        # - weekend declines
+        # - a temporarily delayed GitHub runner
+
+        if delay_seconds >= 600:
+
+            lines.append(
+                (
+                    f"⏰ *Delayed pickup:* "
+                    f"{slack_escape(format_delay(delay_seconds))} "
+                    f"after the transaction occurred."
+                )
+            )
 
     if invoice:
 
@@ -711,6 +864,7 @@ def main():
 
     # First narrow the Authorize.Net list
     # down to actual declined transactions.
+
     declines = [
         transaction
 
@@ -732,6 +886,11 @@ def main():
     ]
 
     # Process oldest -> newest.
+    #
+    # This is important when several declines occurred
+    # overnight or over the weekend. Slack will receive
+    # them in chronological order.
+
     declines.sort(
         key=lambda transaction:
         str(
@@ -747,11 +906,10 @@ def main():
     # TEST MODE
     # ========================================================
     #
-    # Finds the newest declined transaction
-    # specifically from Jotform Live.
+    # Finds the newest declined transaction specifically
+    # from the configured solution (Jotform Live).
     #
-    # Test mode does NOT add the transaction
-    # to the seen list.
+    # Test mode DOES NOT add it to the seen list.
     # ========================================================
 
     if RUN_MODE == "test_latest_decline":
@@ -819,10 +977,7 @@ def main():
     #
     # Everything currently declined is considered OLD.
     #
-    # We do not Slack any of these.
-    #
-    # This should normally only be run when initially
-    # setting up/resetting the monitor.
+    # Do not use this during normal operation.
     # ========================================================
 
     if (
@@ -899,7 +1054,7 @@ def main():
 
 
         # ----------------------------------------------------
-        # ONLY SEND JOTFORM LIVE TO SLACK
+        # ONLY SEND TARGET SOLUTION TO SLACK
         # ----------------------------------------------------
 
         if is_target_solution(
@@ -918,21 +1073,15 @@ def main():
         # REMEMBER THE TRANSACTION
         # ----------------------------------------------------
         #
-        # This is done for BOTH:
+        # We remember BOTH:
         #
-        #   Jotform Live declines
-        #   Non-Jotform declines
+        # - Jotform Live declines
+        # - Non-Jotform declines
         #
-        # That is intentional.
+        # Non-Jotform declines are silently discarded once.
         #
-        # A recurring billing decline that is NOT
-        # Jotform gets inspected once and then ignored
-        # forever instead of being re-checked every
-        # five minutes.
-        #
-        # For a Jotform decline, this line is reached
-        # only AFTER Slack successfully accepted the
-        # alert.
+        # Jotform declines are only marked processed after
+        # Slack successfully accepted the alert.
         # ----------------------------------------------------
 
         seen.append(
